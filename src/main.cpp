@@ -1,10 +1,10 @@
 #include <Arduino.h>
-
 #include <IRremote.hpp>
 #include <math.h>
+#include <time.h>
 #define IR_RECEIVE_PIN 8
 
-// UP = Forward ()
+// UP = Forward (RC)
 // OK = Brake = Hard Deceleration (reverse RC )
 // DOWN = Backward
 // LEFT RIGHT = Steer (We don't have steering system , so we can only employ unequating two motor speed)
@@ -22,25 +22,34 @@ byte speedControlA = 0;
 byte speedControlB = 0;
 unsigned int counter = 0; 
 // to count pass 255 , because my acceleeation function need an ample size of input counter to reach max speedControl
- 
+
 #define RPMpinLT 2
 #define RPMpinRT 3
 
 volatile int revLeft, revRight = 0; // Count of pulses from left counter
 volatile unsigned long lastTime = 0; // Time of last pulse
 
+void resetM();
+int* getRPM(volatile int, volatile int);
+void RemoteCommand();
+void hardbreak();
+void fwd(); void bwd(); void tLeft(); void tRight();
+void accelerate(byte , float, unsigned int);
+void decelerate(byte,float, unsigned int);
+void countPulseL();
+void countPulseR();
+
 void setup() {
   Serial.begin(9600);
-  IrReceiver.begin(IR_RECEIVE_PIN,ENABLE_LED_FEEDBACK); // Start the receiver
-  // (is this a class variable? , I don't even need to )
-
+  IrReceiver.begin(IR_RECEIVE_PIN,ENABLE_LED_FEEDBACK); 
+  // in IRremote 4.0 we don't need to instantiate Receiver or sender object, it is already instantiate in the library
   pinMode(ena, OUTPUT);
   pinMode(enb, OUTPUT);
   pinMode(in1, OUTPUT);
   pinMode(in2, OUTPUT);
   pinMode(in3, OUTPUT);
   pinMode(in4, OUTPUT);
-  pinMode(RPMpinRT, INPUT); // RPM counter Module already has pull up resistor
+  pinMode(RPMpinRT, INPUT); // photointerrupter Module seems to have on board pull up resister
   pinMode(RPMpinLT, INPUT);
   resetM();
 
@@ -50,39 +59,44 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(RPMpinRT), countPulseR, RISING); // for Right wheel
 }
 
+/*Let's use timer interrupt here*/
+// bool isbuttonPressed;
 void loop() {
 
-  //1. Decode IR Remote button
-  
-  if (IrReceiver.decode()) {
-    //2. Execute Command Accordingly
-    RemoteCommand( IrReceiver.decodedIRData.decodedRawData ); // Listen to Remote Command and execute function
-    
-    IrReceiver.resume(); // Enable receiving of the next value or from next IR frame (Next Pulse set)
+// Flag setting mehtod
+// Let's use Timer Interrupt method
 
-  } 
-  delayMicroseconds(10000); // separate condition and buffer with small delay to allow the next decode to registered before falling into this condition
-  if(!IrReceiver.decode()) {
-    // IF WE LET GO OF THE BUTTON
-    // decelerate()
-    Serial.println("***********EXIT"); 
-    // if(speedControl =! 0){    
-    //   speedControl = 0;
-    // } 
-    return;
-  }
-  /*
-  but the counter needs to reset after we letting go of the button , so that the whole accel or decel process will starts from 0
-  which doesn't seems to work by this code , because somehow even in the middle of waiting for next IR pulse , 
-  the condition just fucking met, and this shit resets all the time -> fuck 
-  */
+  //1. Decode IR Remote button
+  //2. Execute Command Accordingly
+  // RemoteCommand();
+ 
+
+  // separate condition and buffer with small delay to allow the next decode to registered before falling into this condition
+  // delay(100);
+
+  
+/*
+but the counter needs to reset after we letting go of the button , so that the whole accel or decel process will starts from 0
+which doesn't seems to work by this code , because somehow even in the middle of waiting for next IR pulse , 
+the condition just met, if we were to resetMotor speed it would resets at some time during acceleration => which made it stop all time
+*/
+  digitalWrite(in2,1);
+  digitalWrite(in3,1);
+  analogWrite(ena,255);
+  analogWrite(enb,255);
 
   /***** Data Acquisition of Sensors*****/
-
-  //RPM from optical counter (Poor accuracy but anyway)
-  // int leftWheelRPM = getRPM(revLeft , revRight)[0];
-  // int rightWheelRPM = getRPM(revLeft,revRight)[1];
-  // Other sensors that I will add
+    Serial.print("Rev Left : ");  
+    Serial.println(revLeft); 
+    Serial.print("Rev Right : ");  
+    Serial.println(revRight); 
+    //RPM from optical counter (Poor accuracy but anyway)
+    Serial.println(getRPM(revLeft , revRight)[0]);  
+    Serial.println(getRPM(revLeft,  revRight)[1]);  
+   
+    delay(150);
+    // ถือว่าใช้งานได้ละ , RPM ถูก reset ทุกครั้งที่ล้อหยุดหมุน
+    /* Other sensors that I will add */
 
 }
 
@@ -94,8 +108,6 @@ void loop() {
     revRight++; // Increment pulse count for attach interrupt void function
   }
 
-//
-
 void resetM(){
   digitalWrite(in1, 0);
   digitalWrite(in2, 0);
@@ -103,52 +115,84 @@ void resetM(){
   digitalWrite(in4, 0);
 }
 
-int getRPM(volatile int pulseCountL , volatile int pulseCountR)[2]{
+
+// To create a function that return an array -> we need to create a function that returns a pointer to the array instead
+int* getRPM(volatile int pulseCountL , volatile int pulseCountR){
   unsigned long currentTime = millis();
-  // keep current time millis() after MCU is active in currentTime
+
+  // Begin the measurement only if the duration from last measurement is more than one sec.
   if(currentTime- lastTime >= 1000){
+
+    // detach interrupt , to stop counting from photo interrupter
     detachInterrupt(digitalPinToInterrupt(RPMpinLT));
     detachInterrupt(digitalPinToInterrupt(RPMpinRT));
-    int rpmL = (pulseCountL / 20.0) * (60000.0 / (currentTime - lastTime));
-    int rpmR = (pulseCountR / 20.0) * (60000.0 / (currentTime - lastTime));
-    revLeft,revRight = 0; // Reset the count
+
+    
+    // Once the function return the pointer to 1st element of this array , all the local variable mem. will be delocated to save space
+    // we can not dereference back the mem of 1st element of this array, anymore 
+    // declare static array to prevent deallocation of this variable mem address
+    static int array[2];
+    array[0] = pulseCountL / 20.0 * (60000.0 / (currentTime - lastTime)); // first address (for Left wheel)
+    array[1] = pulseCountR / 20.0 * (60000.0 / (currentTime - lastTime)); // second address (for Right wheel)
+    if(currentTime - lastTime >= 500){
+      revLeft = revRight = 0; // Reset the count
+    }
+    
+    // the reset is too fast, not enogh time for reading
     attachInterrupt(digitalPinToInterrupt(RPMpinLT), countPulseL, RISING); // RISING from LOW to HIGH
     attachInterrupt(digitalPinToInterrupt(RPMpinRT), countPulseR, RISING);  
     lastTime = currentTime;
-    int array[2] = {rpmL,rpmR};
+    // return rpm_arr;
     return array;
   }
+  return 0 ;
+  // if the RPM doesn't get calculated
 }
 
-void RemoteCommand(int IRrawdata){
-  switch(IRrawdata){
-    case 0xF708FF00:
-      // Turn Left
-      tLeft();
-      break; 
-    case 0xE718FF00:
-      // Up -> fwd
-      fwd();
-      break;
-    case 0xA55AFF00:
-      // Turn Right
-      tRight();
-      break;
-    case 0xAD52FF00:
-      // Down -> bwd
-      bwd();
-      break;
-    case 0xE31CFF00:
-      hardbreak();
-      break;
-    case 0: 
-      counter += 3;
-      accelerate();
-      // Limit speed to exact 255 (100% Duty cycle) regardless of how much we accelerate , 
-      // to simulate a car terminal speed & Acceleration being primary dictated by engine power & gear box
-      break;
+//Remote Command function -> it uses switch case, which is evaluate at compile time ,, the value uses to check different case
+// should be known and pretty much constant (Not a passed argument) , so yeah this will be void
+void RemoteCommand() {
+   if (IrReceiver.decode()) {
+    switch (IrReceiver.decodedIRData.decodedRawData) {
+      case 0xF708FF00:  // Turn Left
+        tLeft();
+        break;
+      case 0xE718FF00:  // Up -> fwd
+        fwd();
+        break;
+      case 0xA55AFF00:  // Turn Right
+        tRight();
+        break;
+      case 0xAD52FF00:  // Down -> bwd
+        bwd();
+        break;
+      case 0xE31CFF00:  // Hard Break
+        hardbreak();
+        break;
+      case 0:  // Handle 0 (no leading zero)
+        counter += 3;
+        accelerate(255, 0.02, counter);
+        // Limit speed to exact 255 (100% Duty cycle) regardless of how much we accelerate , 
+        // to simulate a car terminal speed & Acceleration being primary dictated by engine power & gear box
+        break;
+    }
+
+    // Enable receiving of the next value or from next IR frame (Next Pulse set)
+    IrReceiver.resume(); 
+  } 
+  
+  // IF WE LET GO OF THE BUTTON
+  if(!IrReceiver.decode()) {
+    
+    // decelerate(255,0.02,counter);
+    // Serial.println("***********EXIT"); 
+    // if(speedControl =! 0){    
+    //   speedControl = 0;
+    // } 
+    return;
   }
-} 
+  
+}
 
 /*** Movement function ***/
 
@@ -173,12 +217,12 @@ void RemoteCommand(int IRrawdata){
   }
 
   void tLeft(){ // if Left is Motor A 
-    speedControlB = 0.3 * SpeedControlA;
+    speedControlB = 0.3 * speedControlA;
     // Left needs to rotate slower than Right
   }
 
   void tRight(){ // if Right is Motor B
-    speedControlA = 0.3 * SpeedControlB;
+    speedControlA = 0.3 * speedControlB;
     // Left needs to rotate slower than Right
   }
   // This can potentially leads to chained speed reduction if we concecutively alternate left and right
@@ -192,9 +236,10 @@ void RemoteCommand(int IRrawdata){
     if (speedControl >= 255) {
         speedControl = 255;
       }
-    speedControlA , speedControlB = speedControl;    
+    speedControlA = speedControlB = speedControl;  
   }
 
+  // there needs to be a way to save the current speed (PWM duty we are in right now)
 
   //Deceleration (RC discharge)
   void decelerate(byte currentSpeed ,float konst, unsigned int count){ 
@@ -203,6 +248,6 @@ void RemoteCommand(int IRrawdata){
     if (speedControl <= 0) {
         speedControl = 0;
       }
-    speedControlA , speedControlB = speedControl;    
+    speedControlA = speedControlB = speedControl;    
   }
 
